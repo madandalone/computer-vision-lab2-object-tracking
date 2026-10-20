@@ -1,0 +1,6 @@
+video,frames,detected,detection_rate,good_matches,inliers,inlier_ratio,detected,no_descriptors,not_enough_matches,homography_failed,not_enough_inliers,invalid_geometry
+IMG_6514.MOV,496,484,97.58,143.16,101.01,0.6659,484,0,0,0,4,8
+mona-lisa-blur-extra-credit.avi,557,318,57.09,34.52,19.08,0.4841,318,1,10,20,182,26
+mona-lisa-blur.avi,557,537,96.41,35.5,21.37,0.7745,537,0,5,11,4,0
+mona-lisa.avi,557,368,66.07,39.37,25.01,0.5625,368,0,0,0,158,31
+simple_track.avi,556,238,42.81,28.06,12.8,0.4598,238,0,3,20,253,42
