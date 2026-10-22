@@ -66,145 +66,166 @@ FAILURE_REASONS = [
 ]
 
 
+def order_corners(points):
+    """Упорядочивает углы: левый верхний, правый верхний, правый нижний, левый нижний."""
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.shape != (4, 2):
+        raise ValueError("Нужно выбрать ровно четыре точки")
 
+    # Центр и полярный угол позволяют принимать точки в произвольном порядке.
+    center = pts.mean(axis=0)
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+    pts = pts[np.argsort(angles)]
+    start = np.argmin(pts[:, 0] + pts[:, 1])
+    pts = np.roll(pts, -start, axis=0)
+
+    if not cv2.isContourConvex(pts.reshape(-1, 1, 2)):
+        raise ValueError("Углы должны образовывать выпуклый четырёхугольник")
+    if abs(cv2.contourArea(pts)) < 100:
+        raise ValueError("Выбранная область слишком мала")
+    return pts
+
+
+def extract_reference(frame, points):
+    """Выпрямляет четырёхугольник в прямоугольное изображение эталона."""
+    pts = order_corners(points)
+    tl, tr, br, bl = pts
+    width = int(round(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl))))
+    height = int(round(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))))
+    if width < 16 or height < 16:
+        raise ValueError("Эталон слишком маленький")
+    destination = np.float32([
+        [0, 0], [width - 1, 0],
+        [width - 1, height - 1], [0, height - 1],
+    ])
+    matrix = cv2.getPerspectiveTransform(pts, destination)
+    return cv2.warpPerspective(frame, matrix, (width, height))
+
+
+def select_four_corners(frame, video_name):
+    """Интерактивно выбирает четыре угла, возвращает точки либо None."""
+    window = f"Select 4 corners: {video_name}"
+    points = []
+
+    def on_mouse(event, x, y, flags, userdata):
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
+            points.append([x, y])
+
+    cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(window, on_mouse)
+    print("Нажми на четыре угла объекта. ENTER — подтвердить, R — сбросить, ESC — отменить.")
+    try:
+        while True:
+            preview = frame.copy()
+            for i, (x, y) in enumerate(points):
+                cv2.circle(preview, (x, y), 6, (0, 0, 255), -1)
+                cv2.putText(preview, str(i + 1), (x + 8, y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            if len(points) == 4:
+                try:
+                    corners = order_corners(points)
+                    cv2.polylines(preview, [corners.astype(np.int32)], True, (0, 255, 0), 2)
+                except ValueError:
+                    pass
+            cv2.imshow(window, preview)
+            key = cv2.waitKey(30) & 0xFF
+            if key == 27:
+                return None
+            if key in (ord("r"), ord("R")):
+                points.clear()
+            if key in (13, 10, 32) and len(points) == 4:
+                try:
+                    extract_reference(frame, points)
+                    return points
+                except ValueError as exc:
+                    print(f"Некорректный выбор: {exc}. Нажми R и попробуй снова.")
+    finally:
+        cv2.destroyWindow(window)
 
 
 def get_reference_roi(video_path, first_frame, reselect=False):
-
-    """
-
-    Загружает сохранённый ROI или предлагает выбрать новый.
-
-
-
-    Координаты ROI сохраняются отдельно для каждого видео.
-
-    """
-
-
-
+    """Выбирает кадр и 4 угла. Возвращает выпрямленное изображение эталона или None."""
     ROI_DIR.mkdir(parents=True, exist_ok=True)
-
-
-
     roi_path = ROI_DIR / f"{video_path.stem}_roi.json"
-
-
-
-    frame_height, frame_width = first_frame.shape[:2]
-
-
-
-    if roi_path.exists() and not reselect:
-
-        with open(roi_path, "r", encoding="utf-8") as file:
-
-            data = json.load(file)
-
-
-
-        x = int(data["x"])
-
-        y = int(data["y"])
-
-        w = int(data["w"])
-
-        h = int(data["h"])
-
-
-
-        # Проверяем, что ROI помещается в исходный кадр.
-
-        if (
-
-            x >= 0
-
-            and y >= 0
-
-            and w > 0
-
-            and h > 0
-
-            and x + w <= frame_width
-
-            and y + h <= frame_height
-
-        ):
-
-            print(f"Загружен сохранённый ROI: {roi_path}")
-
-            return x, y, w, h
-
-
-
-        print("Сохранённый ROI некорректен. Выбери новый.")
-
-
-
-    print("Выдели объект на первом кадре.")
-
-
-
-    roi = cv2.selectROI(
-
-        f"Select object: {video_path.name}",
-
-        first_frame,
-
-        showCrosshair=True,
-
-        fromCenter=False,
-
-    )
-
-
-
-    cv2.destroyAllWindows()
-
-
-
-    x, y, w, h = map(int, roi)
-
-
-
-    if w <= 0 or h <= 0:
-
-        return None
-
-
-
-    data = {
-
-        "x": x,
-
-        "y": y,
-
-        "w": w,
-
-        "h": h,
-
-        "frame_width": frame_width,
-
-        "frame_height": frame_height,
-
-    }
-
-
-
-    with open(roi_path, "w", encoding="utf-8") as file:
-
-        json.dump(data, file, indent=4)
-
-
-
-    print(f"ROI сохранён: {roi_path}")
-
-
-
-    return x, y, w, h
-
-
-
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Не удалось открыть видео: {video_path}")
+
+    try:
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if frame_count <= 0:
+            raise RuntimeError("Не удалось определить количество кадров")
+
+        def read_frame(index):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+            ok, frame = cap.read()
+            return frame if ok else None
+
+        if roi_path.exists() and not reselect:
+            try:
+                data = json.loads(roi_path.read_text(encoding="utf-8"))
+                index = int(data.get("frame_idx", 0))
+                if not 0 <= index < frame_count or "points" not in data:
+                    raise ValueError("Сохранённый формат устарел или номер кадра некорректен")
+                frame = read_frame(index)
+                if frame is None:
+                    raise ValueError("Не удалось прочитать эталонный кадр")
+                h, w = frame.shape[:2]
+                points = np.asarray(data["points"], dtype=np.float32)
+                if points.shape != (4, 2) or not np.isfinite(points).all():
+                    raise ValueError("Некорректные координаты")
+                if (points[:, 0] < 0).any() or (points[:, 0] >= w).any() or (points[:, 1] < 0).any() or (points[:, 1] >= h).any():
+                    raise ValueError("Точки за пределами кадра")
+                reference = extract_reference(frame, points)
+                print(f"Загружен эталон: {roi_path}, кадр {index}")
+                return reference
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                print(f"Нужно выбрать новый эталон: {exc}")
+
+        window = f"Select reference frame: {video_path.name}"
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        selected_idx = 0
+        selected_frame = first_frame.copy()
+
+        def on_trackbar(value):
+            nonlocal selected_idx, selected_frame
+            frame = read_frame(value)
+            if frame is not None:
+                selected_idx = value
+                selected_frame = frame
+                preview = frame.copy()
+                cv2.putText(preview, f"Frame {value}/{frame_count - 1} | ENTER: select | ESC: cancel",
+                            (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.imshow(window, preview)
+
+        try:
+            cv2.createTrackbar("Frame", window, 0, frame_count - 1, on_trackbar)
+            on_trackbar(0)
+            print("Выбери кадр ползунком и нажми ENTER.")
+            while True:
+                key = cv2.waitKey(30) & 0xFF
+                if key in (13, 10, 32):
+                    break
+                if key == 27:
+                    return None
+        finally:
+            cv2.destroyWindow(window)
+
+        points = select_four_corners(selected_frame, video_path.name)
+        if points is None:
+            return None
+        reference = extract_reference(selected_frame, points)
+        data = {
+            "frame_idx": selected_idx,
+            "points": [[int(x), int(y)] for x, y in points],
+            "frame_width": int(selected_frame.shape[1]),
+            "frame_height": int(selected_frame.shape[0]),
+        }
+        roi_path.write_text(json.dumps(data, ensure_ascii=False, indent=4), encoding="utf-8")
+        print(f"Эталон сохранён: {roi_path}; кадр {selected_idx}; размер {reference.shape[1]}x{reference.shape[0]}")
+        return reference
+    finally:
+        cap.release()
 
 
 def save_debug_image(tracker, frame, video_name, frame_number, suffix):
@@ -295,41 +316,21 @@ def process_video(video_path, reselect_roi=False):
 
 
 
-    roi = get_reference_roi(video_path, first_frame, reselect=reselect_roi)
-
-
-
-    if roi is None:
-
-        cap.release()
-
-        print("Объект не выбран, видео пропущено")
-
-        return None
-
-
-
-    x, y, w, h = roi
-
-
-
-    # Создаём эталонное изображение.
-
-    reference = first_frame[y:y + h, x:x + w]
-
-
-
-    reference_gray = cv2.cvtColor(
-
-        reference,
-
-        cv2.COLOR_BGR2GRAY,
-
+    reference = get_reference_roi(
+        video_path, first_frame, reselect=reselect_roi
     )
 
+    if reference is None:
+        cap.release()
+        print("Объект не выбран, видео пропущено")
+        return None
 
+    reference_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)
 
     tracker = ObjectTracker(reference_gray)
+
+    # Эталон может быть взят из любого кадра, но обработка начинается с нулевого.
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
 
 
@@ -432,7 +433,15 @@ def process_video(video_path, reselect_roi=False):
 
             corners = tracker.track(frame)
 
-
+            if (
+                video_path.stem == "simple_track"
+                and corners is None
+                and tracker.last_failure_reason == "invalid_geometry"
+            ):
+                print(
+                    f"Кадр {frame_count}: "
+                    f"{tracker.last_geometry_failure}"
+                )
 
             reason = tracker.last_failure_reason
             method = tracker.last_method
@@ -1053,8 +1062,8 @@ def main():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-    description="Трекинг объекта: SIFT + Lucas-Kanade"
-)
+        description="Трекинг объекта: SIFT + Lucas-Kanade"
+    )
 
     parser.add_argument(
         "--reselect-roi",

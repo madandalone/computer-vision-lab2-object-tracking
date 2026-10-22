@@ -44,6 +44,12 @@ class ObjectTracker:
         # Параметры оптического потока.
         self.min_flow_inliers = 8
 
+        # Устойчивость гомографии: точки должны покрывать часть эталона.
+        self.min_reference_span = 0.10
+        self.max_median_reprojection_error = 4.0
+        # Если объект частично вышел из кадра, достаточно видеть 10% его площади.
+        self.min_visible_fraction = 0.10
+
         self.lk_params = {
             "winSize": (21, 21),
             "maxLevel": 3,
@@ -68,6 +74,7 @@ class ObjectTracker:
         self.last_inliers = 0
         self.last_inlier_ratio = 0.0
         self.last_failure_reason = None
+        self.last_geometry_failure = None
 
         # Метод, который обнаружил объект.
         self.last_method = None
@@ -97,6 +104,7 @@ class ObjectTracker:
         self.last_inliers = 0
         self.last_inlier_ratio = 0.0
         self.last_failure_reason = None
+        self.last_geometry_failure = None
         self.last_method = None
 
         self.last_keypoints = []
@@ -212,9 +220,9 @@ class ObjectTracker:
             H,
         )
 
-        if not self.valid_corners(
-            projected,
-            frame.shape,
+        if not self._validate_homography(
+            src_points[inlier_mask], dst_points[inlier_mask], H,
+            projected, frame.shape,
         ):
             self.last_failure_reason = "invalid_geometry"
             return None
@@ -292,9 +300,9 @@ class ObjectTracker:
             H,
         )
 
-        if not self.valid_corners(
-            projected,
-            frame_shape,
+        if not self._validate_homography(
+            src_points[inlier_mask], dst_points[inlier_mask], H,
+            projected, frame_shape,
         ):
             return None
 
@@ -398,44 +406,69 @@ class ObjectTracker:
 
         return visualization
 
-    @staticmethod
-    def valid_corners(corners, frame_shape):
-        """
-        Проверяет геометрию четырёхугольника.
-        """
+    def _validate_homography(self, src, dst, H, corners, frame_shape):
+        """Отсекает геометрически неустойчивые преобразования."""
+        self.last_geometry_failure = None
+        ref_h, ref_w = self.reference_image.shape
+        src_xy = np.asarray(src, dtype=np.float32).reshape(-1, 2)
+        dst_xy = np.asarray(dst, dtype=np.float32).reshape(-1, 2)
 
+        # Inliers должны быть распределены по эталону, а не сгруппированы
+        # на крошечном фрагменте: иначе углы могут сильно экстраполироваться.
+        spread = np.ptp(src_xy, axis=0)
+        if (spread[0] < ref_w * self.min_reference_span or
+                spread[1] < ref_h * self.min_reference_span):
+            self.last_geometry_failure = "poor_inlier_coverage"
+            return False
+
+        predicted = cv2.perspectiveTransform(src_xy.reshape(-1, 1, 2), H)
+        errors = np.linalg.norm(predicted.reshape(-1, 2) - dst_xy, axis=1)
+        if (not np.isfinite(errors).all() or
+                float(np.median(errors)) > self.max_median_reprojection_error):
+            self.last_geometry_failure = "high_reprojection_error"
+            return False
+
+        return self.valid_corners(corners, frame_shape)
+
+    def valid_corners(self, corners, frame_shape):
+        """Проверяет выпуклость, площадь и видимость четырёхугольника.
+
+        Частичный выход за кадр допустим, если значимая часть объекта
+        остаётся видимой. Не обрезаем углы: это испортило бы геометрию.
+        """
         height, width = frame_shape[:2]
-
-        points = corners.reshape(4, 2).astype(
-            np.float32
-        )
+        points = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+        self.last_geometry_failure = None
 
         if not np.isfinite(points).all():
+            self.last_geometry_failure = "non_finite"
+            return False
+        if not cv2.isContourConvex(points.reshape(-1, 1, 2)):
+            self.last_geometry_failure = "non_convex"
             return False
 
-        if not cv2.isContourConvex(
-            points.reshape(-1, 1, 2)
-        ):
-            return False
-
-        area = cv2.contourArea(points)
-        frame_area = height * width
-
+        area = float(abs(cv2.contourArea(points)))
+        frame_area = float(height * width)
         if area < frame_area * 0.001:
+            self.last_geometry_failure = "too_small"
             return False
-
         if area > frame_area * 2.0:
+            self.last_geometry_failure = "too_large"
             return False
 
-        margin_x = width * 0.2
-        margin_y = height * 0.2
-
-        if (
-            np.any(points[:, 0] < -margin_x)
-            or np.any(points[:, 0] > width + margin_x)
-            or np.any(points[:, 1] < -margin_y)
-            or np.any(points[:, 1] > height + margin_y)
-        ):
+        # Защита от огромной рамки, возникающей из-за неверной гомографии.
+        bounds = np.ptp(points, axis=0)
+        if bounds[0] > 2.5 * width or bounds[1] > 2.5 * height:
+            self.last_geometry_failure = "unrealistic_extent"
             return False
 
+        # OpenCV вычисляет пересечение двух выпуклых многоугольников.
+        image_rect = np.float32([
+            [0, 0], [width - 1, 0],
+            [width - 1, height - 1], [0, height - 1],
+        ])
+        visible_area, _ = cv2.intersectConvexConvex(points, image_rect)
+        if visible_area <= 0 or visible_area / area < self.min_visible_fraction:
+            self.last_geometry_failure = "outside_frame"
+            return False
         return True
